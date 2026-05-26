@@ -36,7 +36,16 @@ export default {
                     usage_json.success = true;
                     usage_json.total = (usage_json.pages || 0) + (usage_json.workers || 0);
                     usage_json.msg = '✅ 成功加载免费额度使用数据';
-                    if (!已保存更新时间 || (当前时间 - 已保存更新时间) > 获取单账号查询间隔毫秒(env)) usage_json = await 更新请求数(env);
+                    if (!已保存更新时间 || (当前时间 - 已保存更新时间) > 获取单账号查询间隔毫秒(env)) {
+                        if (已保存更新时间 && ctx && typeof ctx.waitUntil === 'function') {
+                            usage_json.stale = true;
+                            usage_json.refreshing = true;
+                            usage_json.msg = '✅ 成功加载缓存数据，后台刷新中';
+                            ctx.waitUntil(后台更新请求数(env).catch(error => console.error('后台刷新使用数据失败:', error.message)));
+                        } else {
+                            usage_json = await 更新请求数(env);
+                        }
+                    }
                 }
                 return new Response(JSON.stringify(usage_json, null, 2), { headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' } });
             } else if (访问路径 == 'admin' || 访问路径.startsWith('admin/')) {// 管理员面板
@@ -451,6 +460,20 @@ function 获取每轮最多外部子请求数(env = {}) {
     return 默认每轮最多外部子请求数;
 }
 
+async function 后台更新请求数(env) {
+    const lockKey = 'usage_refresh_lock';
+    const now = Date.now();
+    const lockTime = Number(await env.KV.get(lockKey)) || 0;
+    if (lockTime && now - lockTime < 2 * 60 * 1000) return;
+
+    await env.KV.put(lockKey, String(now), { expirationTtl: 120 });
+    try {
+        await 更新请求数(env);
+    } finally {
+        await env.KV.delete(lockKey);
+    }
+}
+
 function 估算账号查询外部子请求数(account = {}) {
     if (account.AccountID) return 4;
     if (account.Email && account.GlobalAPIKey) return 5;
@@ -805,13 +828,6 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 
         const 时间窗口 = 获取统计时间窗口();
         const usage = 创建默认Usage(true, '✅ 成功更新免费额度使用数据');
-        const core = await 查询WorkersPages统计(API, hdr, AccountID, 时间窗口);
-
-        usage.pages = core.pages;
-        usage.workers = core.workers;
-        usage.total = core.pages + core.workers;
-        usage.max = 免费额度.requestsDaily;
-
         const errors = [];
         const safeQuery = async (label, query, defaultValue) => {
             try {
@@ -823,12 +839,17 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
             }
         };
 
-        const [d1, kv, r2] = await Promise.all([
+        const [core, d1, kv, r2] = await Promise.all([
+            查询WorkersPages统计(API, hdr, AccountID, 时间窗口),
             safeQuery('D1', () => 查询D1统计(API, hdr, AccountID, 时间窗口), 创建默认资源统计().d1),
             safeQuery('KV', () => 查询KV统计(API, hdr, AccountID, 时间窗口), 创建默认资源统计().kv),
             safeQuery('R2', () => 查询R2统计(API, hdr, AccountID, 时间窗口), 创建默认资源统计().r2)
         ]);
 
+        usage.pages = core.pages;
+        usage.workers = core.workers;
+        usage.total = core.pages + core.workers;
+        usage.max = 免费额度.requestsDaily;
         usage.resources.d1 = d1;
         usage.resources.kv = kv;
         usage.resources.r2 = r2;
